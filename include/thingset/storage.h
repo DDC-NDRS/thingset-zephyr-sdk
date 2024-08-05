@@ -22,7 +22,7 @@ extern "C" {
  *
  * @returns 0 for success or negative errno in case of error
  */
-int thingset_storage_load();
+int thingset_storage_load(void);
 
 /**
  * Save data from RAM into persistent storage
@@ -32,7 +32,7 @@ int thingset_storage_load();
  *
  * @returns 0 for success or negative errno in case of error
  */
-int thingset_storage_save();
+int thingset_storage_save(void);
 
 /**
  * Save data from RAM into persistent storage (via work queue)

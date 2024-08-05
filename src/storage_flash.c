@@ -25,40 +25,39 @@ LOG_MODULE_REGISTER(thingset_storage_nvs, CONFIG_THINGSET_SDK_LOG_LEVEL);
  *
  * Data starts from byte 2
  */
-#define NVS_HEADER_SIZE 2
+#define NVS_HEADER_SIZE         2
 
-#define NVS_PARTITION storage_partition
+#define NVS_PARTITION           storage_partition
 
-#define THINGSET_DATA_ID 1
+#define THINGSET_DATA_ID        1
 
 static struct nvs_fs fs;
 static bool nvs_initialized = false;
 
-static int data_storage_init()
-{
+static int data_storage_init(void) {
     struct flash_pages_info page_info;
     int err;
 
     fs.flash_device = FIXED_PARTITION_DEVICE(NVS_PARTITION);
     if (!device_is_ready(fs.flash_device)) {
         LOG_ERR("Flash device not ready");
-        return -ENODEV;
+        return (-ENODEV);
     }
 
     fs.offset = FIXED_PARTITION_OFFSET(NVS_PARTITION);
-    err = flash_get_page_info_by_offs(fs.flash_device, fs.offset, &page_info);
+    err       = flash_get_page_info_by_offs(fs.flash_device, fs.offset, &page_info);
     if (err) {
         LOG_ERR("Unable to get flash page info");
-        return err;
+        return (err);
     }
 
-    fs.sector_size = page_info.size;
+    fs.sector_size  = page_info.size;
     fs.sector_count = FIXED_PARTITION_SIZE(NVS_PARTITION) / page_info.size;
 
     err = nvs_mount(&fs);
     if (err) {
         LOG_ERR("NVS mount failed: %d", err);
-        return err;
+        return (err);
     }
 
     nvs_initialized = true;
@@ -66,18 +65,17 @@ static int data_storage_init()
     return 0;
 }
 
-int thingset_storage_load()
-{
-    int err = 0;
+int thingset_storage_load(void) {
+    int err;
 
     if (!nvs_initialized) {
         int err = data_storage_init();
         if (err != 0) {
-            return err;
+            return (err);
         }
     }
 
-    struct shared_buffer *sbuf = thingset_sdk_shared_buffer();
+    struct shared_buffer* sbuf = thingset_sdk_shared_buffer();
     k_sem_take(&sbuf->lock, K_FOREVER);
 
     int num_bytes = nvs_read(&fs, THINGSET_DATA_ID, sbuf->data, sbuf->size);
@@ -89,11 +87,12 @@ int thingset_storage_load()
 
     LOG_HEXDUMP_DBG(sbuf->data, num_bytes, "data to be imported");
 
-    uint16_t version = *((uint16_t *)&sbuf->data[0]);
+    uint16_t version = *((uint16_t*)&sbuf->data[0]);
     if (version == CONFIG_THINGSET_STORAGE_DATA_VERSION) {
-        int status =
-            thingset_import_data(&ts, sbuf->data + NVS_HEADER_SIZE, num_bytes - NVS_HEADER_SIZE,
-                                 THINGSET_WRITE_MASK, THINGSET_BIN_IDS_VALUES);
+        int status = thingset_import_data(&ts,
+                                          (sbuf->data + NVS_HEADER_SIZE),
+                                          (num_bytes - NVS_HEADER_SIZE),
+                                          THINGSET_WRITE_MASK, THINGSET_BIN_IDS_VALUES);
         if (status == 0) {
             LOG_DBG("NVS read and data successfully updated");
         }
@@ -107,31 +106,32 @@ int thingset_storage_load()
         err = -EINVAL;
     }
 
-out:
+out :
     k_sem_give(&sbuf->lock);
 
-    return err;
+    return (err);
 }
 
-int thingset_storage_save()
-{
-    int err = 0;
+int thingset_storage_save(void) {
+    int err;
 
+    err = 0;
     if (!nvs_initialized) {
-        int err = data_storage_init();
+        err = data_storage_init();
         if (err != 0) {
-            return err;
+            return (err);
         }
     }
 
-    struct shared_buffer *sbuf = thingset_sdk_shared_buffer();
+    struct shared_buffer* sbuf = thingset_sdk_shared_buffer();
     k_sem_take(&sbuf->lock, K_FOREVER);
 
-    *((uint16_t *)&sbuf->data[0]) = (uint16_t)CONFIG_THINGSET_STORAGE_DATA_VERSION;
+    *((uint16_t*)&sbuf->data[0]) = (uint16_t)CONFIG_THINGSET_STORAGE_DATA_VERSION;
 
-    int len =
-        thingset_export_subsets(&ts, sbuf->data + NVS_HEADER_SIZE, sbuf->size - NVS_HEADER_SIZE,
-                                TS_SUBSET_NVM, THINGSET_BIN_IDS_VALUES);
+    int len = thingset_export_subsets(&ts,
+                                      (sbuf->data + NVS_HEADER_SIZE),
+                                      (sbuf->size - NVS_HEADER_SIZE),
+                                      TS_SUBSET_NVM, THINGSET_BIN_IDS_VALUES);
 
     LOG_HEXDUMP_DBG(sbuf->data, len + NVS_HEADER_SIZE, "data to be saved");
 
@@ -155,5 +155,5 @@ int thingset_storage_save()
 
     k_sem_give(&sbuf->lock);
 
-    return err;
+    return (err);
 }
