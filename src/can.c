@@ -10,7 +10,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/net/buf.h>
+#include <zephyr/net_buf.h>
 #include <zephyr/random/random.h>
 
 #include <thingset.h>
@@ -22,9 +22,10 @@ LOG_MODULE_REGISTER(thingset_can, CONFIG_THINGSET_SDK_LOG_LEVEL);
 
 extern uint8_t eui64[8];
 
-#define EVENT_ADDRESS_CLAIM_MSG_SENT    0x01
-#define EVENT_ADDRESS_CLAIMING_FINISHED 0x02
-#define EVENT_ADDRESS_ALREADY_USED      0x03
+#define EVENT_ADDRESS_CLAIM_MSG_SENT    BIT(1)
+#define EVENT_ADDRESS_CLAIMING_FINISHED BIT(2)
+#define EVENT_ADDRESS_ALREADY_USED      BIT(3)
+#define EVENT_ADDRESS_CLAIM_TIMED_OUT   BIT(4)
 
 #ifdef CONFIG_THINGSET_CAN_ITEM_RX
 static const struct can_filter sf_report_filter = {
@@ -117,6 +118,13 @@ static void thingset_can_addr_claim_tx_cb(const struct device *dev, int error, v
     }
     else {
         LOG_ERR("Address claim failed with %d", error);
+    }
+}
+
+static void thingset_can_addr_discovery_tx_cb(const struct device *dev, int error, void *user_data)
+{
+    if (error != 0) {
+        LOG_ERR("Address discovery failed with %d", error);
     }
 }
 
@@ -375,7 +383,7 @@ static void thingset_can_control_reporting_handler(struct k_work *work)
     struct shared_buffer *sbuf = thingset_sdk_shared_buffer();
 
     struct thingset_data_object *obj = NULL;
-    while (live_reporting_enable
+    while (ts_can->control_enable
            && (obj = thingset_iterate_subsets(&ts, CONFIG_THINGSET_CAN_CONTROL_SUBSET, obj))
                   != NULL)
     {
@@ -388,7 +396,7 @@ static void thingset_can_control_reporting_handler(struct k_work *work)
         else if (data_len > 0) {
             memcpy(frame.data, sbuf->data, data_len);
             k_sem_give(&sbuf->lock);
-            frame.id = THINGSET_CAN_TYPE_SF_REPORT | THINGSET_CAN_PRIO_REPORT_LOW
+            frame.id = THINGSET_CAN_TYPE_SF_REPORT | THINGSET_CAN_PRIO_CONTROL_LOW
                        | THINGSET_CAN_DATA_ID_SET(obj->id)
                        | THINGSET_CAN_SOURCE_SET(ts_can->node_addr);
 #ifdef CONFIG_CAN_FD_MODE
@@ -410,11 +418,10 @@ static void thingset_can_control_reporting_handler(struct k_work *work)
         obj++; /* continue with object behind current one */
     }
 
-    ts_can->next_control_report_time += CONFIG_THINGSET_CAN_CONTROL_REPORTING_PERIOD;
+    ts_can->next_control_report_time += ts_can->control_period;
     if (ts_can->next_control_report_time <= k_uptime_get()) {
         /* ensure proper initialization of next_control_report_time */
-        ts_can->next_control_report_time =
-            k_uptime_get() + CONFIG_THINGSET_CAN_CONTROL_REPORTING_PERIOD;
+        ts_can->next_control_report_time = k_uptime_get() + ts_can->control_period;
     }
 
     thingset_sdk_reschedule_work(dwork, K_TIMEOUT_ABS_MS(ts_can->next_control_report_time));
@@ -449,7 +456,7 @@ static void thingset_can_reqresp_timeout_handler(struct k_timer *timer)
 {
     struct thingset_can_request_response *rr =
         CONTAINER_OF(timer, struct thingset_can_request_response, timer);
-    rr->callback(NULL, 0, 0, -ETIMEDOUT, 0, rr->cb_arg);
+    rr->callback(NULL, 0, 0, -ETIMEDOUT, THINGSET_CAN_SOURCE_GET(rr->can_id), rr->cb_arg);
     thingset_can_reset_request_response(rr);
 }
 
@@ -481,7 +488,7 @@ int thingset_can_send_inst(struct thingset_can *ts_can, uint8_t *tx_buf, size_t 
         ts_can->request_response.callback = callback;
         ts_can->request_response.cb_arg = callback_arg;
         k_timer_init(&ts_can->request_response.timer, thingset_can_reqresp_timeout_handler, NULL);
-        k_timer_start(&ts_can->request_response.timer, timeout, timeout);
+        k_timer_start(&ts_can->request_response.timer, timeout, K_NO_WAIT);
         ts_can->request_response.can_id = thingset_can_get_tx_addr(&tx_addr).ext_id;
     }
 
@@ -548,9 +555,16 @@ static void thingset_can_reqresp_recv_error_callback(int8_t error, struct isotp_
 static void thingset_can_reqresp_sent_callback(int result, void *arg)
 {
     struct thingset_can *ts_can = arg;
-    if (ts_can->request_response.callback != NULL && result != 0) {
-        ts_can->request_response.callback(NULL, 0, 0, result, 0, ts_can->request_response.cb_arg);
+    if (ts_can->request_response.callback != NULL) {
+        ts_can->request_response.callback(NULL, 0, 0, result,
+                                          THINGSET_CAN_SOURCE_GET(ts_can->request_response.can_id),
+                                          ts_can->request_response.cb_arg);
         thingset_can_reset_request_response(&ts_can->request_response);
+        if (result == 0) {
+            /* maintain unlocking semantics of previous iteration of this code */
+            struct shared_buffer *sbuf = thingset_sdk_shared_buffer();
+            k_sem_give(&sbuf->lock);
+        }
     }
     else {
         struct shared_buffer *sbuf = thingset_sdk_shared_buffer();
@@ -558,8 +572,14 @@ static void thingset_can_reqresp_sent_callback(int result, void *arg)
     }
 }
 
+static void thingset_can_timeout_timer_expired(struct k_timer *timer)
+{
+    struct thingset_can *ts_can = CONTAINER_OF(timer, struct thingset_can, timeout_timer);
+    k_event_set(&ts_can->events, EVENT_ADDRESS_CLAIM_TIMED_OUT);
+}
+
 int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can_dev,
-                           uint8_t bus_number)
+                           uint8_t bus_number, k_timeout_t timeout)
 {
     struct can_frame tx_frame = {
         .flags = CAN_FRAME_IDE,
@@ -579,11 +599,14 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
 #endif
     k_sem_init(&ts_can->request_response.sem, 1, 1);
     k_sem_init(&ts_can->report_tx_sem, 0, 1);
+    k_timer_init(&ts_can->timeout_timer, thingset_can_timeout_timer_expired, NULL);
 
 #ifdef CONFIG_THINGSET_SUBSET_LIVE_METRICS
     k_work_init_delayable(&ts_can->live_reporting_work, thingset_can_live_reporting_handler);
 #endif
 #ifdef CONFIG_THINGSET_CAN_CONTROL_REPORTING
+    ts_can->control_enable = IS_ENABLED(CONFIG_THINGSET_CAN_CONTROL_REPORTING_ENABLE_PRESET);
+    ts_can->control_period = CONFIG_THINGSET_CAN_CONTROL_REPORTING_PERIOD;
     k_work_init_delayable(&ts_can->control_reporting_work, thingset_can_control_reporting_handler);
 #endif
     k_work_init_delayable(&ts_can->addr_claim_work, thingset_can_addr_claim_tx_handler);
@@ -597,6 +620,7 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
     }
 
     k_event_init(&ts_can->events);
+    k_timer_start(&ts_can->timeout_timer, timeout, K_NO_WAIT);
 
 #ifdef CONFIG_CAN_FD_MODE
     can_mode_t supported_modes;
@@ -639,11 +663,14 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
         can_add_rx_filter(ts_can->dev, thingset_can_addr_claim_rx_cb, ts_can, &addr_claim_filter);
     if (filter_id < 0) {
         LOG_ERR("Unable to add addr_claim filter: %d", filter_id);
+        k_timer_stop(&ts_can->timeout_timer);
         return filter_id;
     }
 
     while (1) {
-        k_event_clear(&ts_can->events, EVENT_ADDRESS_ALREADY_USED);
+        k_event_clear(&ts_can->events, EVENT_ADDRESS_CLAIM_MSG_SENT
+                                           | EVENT_ADDRESS_CLAIMING_FINISHED
+                                           | EVENT_ADDRESS_ALREADY_USED);
 
         /* send out address discovery frame */
         uint8_t rand = sys_rand32_get() & 0xFF;
@@ -651,15 +678,17 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
                       | THINGSET_CAN_RAND_SET(rand) | THINGSET_CAN_TARGET_SET(ts_can->node_addr)
                       | THINGSET_CAN_SOURCE_SET(THINGSET_CAN_ADDR_ANONYMOUS);
         tx_frame.dlc = 0;
-        err = can_send(ts_can->dev, &tx_frame, K_MSEC(10), NULL, NULL);
+        err =
+            can_send(ts_can->dev, &tx_frame, K_MSEC(10), thingset_can_addr_discovery_tx_cb, ts_can);
         if (err != 0) {
             k_sleep(K_MSEC(100));
             continue;
         }
 
         /* wait 500 ms for address claim message from other node */
-        uint32_t event =
-            k_event_wait(&ts_can->events, EVENT_ADDRESS_ALREADY_USED, false, K_MSEC(500));
+        uint32_t event = k_event_wait(&ts_can->events,
+                                      EVENT_ADDRESS_ALREADY_USED | EVENT_ADDRESS_CLAIM_TIMED_OUT,
+                                      false, K_MSEC(500));
         if (event & EVENT_ADDRESS_ALREADY_USED) {
             /* try again with new random node_addr between 0x01 and 0xFD */
             ts_can->node_addr =
@@ -667,14 +696,26 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
                 + sys_rand32_get() % (THINGSET_CAN_ADDR_MAX - THINGSET_CAN_ADDR_MIN);
             LOG_WRN("Node addr already in use, trying 0x%.2X", ts_can->node_addr);
         }
+        else if (event & EVENT_ADDRESS_CLAIM_TIMED_OUT) {
+            LOG_ERR("Address claim timed out");
+            k_timer_stop(&ts_can->timeout_timer);
+            return -ETIMEDOUT;
+        }
         else {
             struct can_bus_err_cnt err_cnt_before;
             can_get_state(ts_can->dev, NULL, &err_cnt_before);
 
             thingset_sdk_reschedule_work(&ts_can->addr_claim_work, K_NO_WAIT);
 
-            event = k_event_wait(&ts_can->events, EVENT_ADDRESS_CLAIM_MSG_SENT, false, K_MSEC(100));
-            if (!(event & EVENT_ADDRESS_CLAIM_MSG_SENT)) {
+            event = k_event_wait(&ts_can->events,
+                                 EVENT_ADDRESS_CLAIM_MSG_SENT | EVENT_ADDRESS_CLAIM_TIMED_OUT,
+                                 false, K_MSEC(100));
+            if (event & EVENT_ADDRESS_CLAIM_TIMED_OUT) {
+                LOG_ERR("Address claim timed out");
+                k_timer_stop(&ts_can->timeout_timer);
+                return -ETIMEDOUT;
+            }
+            else if (!(event & EVENT_ADDRESS_CLAIM_MSG_SENT)) {
                 k_sleep(K_MSEC(100));
                 continue;
             }
@@ -685,6 +726,7 @@ int thingset_can_init_inst(struct thingset_can *ts_can, const struct device *can
             if (err_cnt_after.tx_err_cnt <= err_cnt_before.tx_err_cnt) {
                 /* address claiming is finished */
                 k_event_post(&ts_can->events, EVENT_ADDRESS_CLAIMING_FINISHED);
+                k_timer_stop(&ts_can->timeout_timer);
                 LOG_INF("Using CAN node address 0x%.2X on %s", ts_can->node_addr,
                         ts_can->dev->name);
                 break;
@@ -844,7 +886,8 @@ static void thingset_can_thread()
     int err;
 
     LOG_DBG("Initialising ThingSet CAN");
-    err = thingset_can_init_inst(&ts_can_single, can_dev, CONFIG_THINGSET_CAN_DEFAULT_ROUTE);
+    err = thingset_can_init_inst(&ts_can_single, can_dev, CONFIG_THINGSET_CAN_DEFAULT_ROUTE,
+                                 K_FOREVER);
     if (err != 0) {
         LOG_ERR("Failed to init ThingSet CAN: %d", err);
         return;
