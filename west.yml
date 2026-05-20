@@ -12,10 +12,10 @@ manifest:
   projects:
     - name: zephyr
       remote: zephyrproject
-      revision: v4.0-branch
+      revision: v4.4-branch
       import:
         name-allowlist:
-          - cmsis
+          - cmsis_6
           - edtt
           - hal_espressif
           - hal_nordic
@@ -26,10 +26,11 @@ manifest:
           - mcuboot
           - picolibc
           - segger
+          - tf-psa-crypto
           - tinycrypt
           - zcbor
     - name: thingset-node-c
       remote: thingset
-      revision: 2ed57596d363053178aa6104dcd062be3f2b92ce
+      revision: b0b13262e9ddf144551bc05d8764ffbb462e8c89
       path: modules/thingset-node-c
       import: true

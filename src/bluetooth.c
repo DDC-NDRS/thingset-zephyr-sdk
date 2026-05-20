@@ -13,7 +13,7 @@
 #include <zephyr/logging/log.h>
 
 #include <thingset.h>
-#include <thingset/ble.h>
+#include <thingset/bluetooth.h>
 #include <thingset/sdk.h>
 #include <thingset/storage.h>
 
@@ -23,7 +23,7 @@
 
 #include "packetizer.h"
 
-LOG_MODULE_REGISTER(thingset_ble, CONFIG_THINGSET_SDK_LOG_LEVEL);
+LOG_MODULE_REGISTER(thingset_bluetooth, CONFIG_THINGSET_SDK_LOG_LEVEL);
 
 /* ThingSet Custom Service: xxxxyyyy-5423-4887-9c6a-14ad27bfc06d */
 #define BT_UUID_THINGSET_SERVICE_VAL \
@@ -42,14 +42,14 @@ LOG_MODULE_REGISTER(thingset_ble, CONFIG_THINGSET_SDK_LOG_LEVEL);
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
-static ssize_t thingset_ble_rx(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                               const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t thingset_bluetooth_rx(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                     const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 
-static void thingset_ble_disconn(struct bt_conn *conn, uint8_t reason);
+static void thingset_bluetooth_disconn(struct bt_conn *conn, uint8_t reason);
 
-static void thingset_ble_conn(struct bt_conn *conn, uint8_t err);
+static void thingset_bluetooth_conn(struct bt_conn *conn, uint8_t err);
 
-static void thingset_ble_ccc_change(const struct bt_gatt_attr *attr, uint16_t value);
+static void thingset_bluetooth_ccc_change(const struct bt_gatt_attr *attr, uint16_t value);
 
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -61,8 +61,8 @@ static const struct bt_data sd[] = {
 };
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
-    .connected = thingset_ble_conn,
-    .disconnected = thingset_ble_disconn,
+    .connected = thingset_bluetooth_conn,
+    .disconnected = thingset_bluetooth_disconn,
 };
 
 /* UART Service Declaration, order of parameters matters! */
@@ -70,10 +70,10 @@ BT_GATT_SERVICE_DEFINE(thingset_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_THINGSET_SE
                        BT_GATT_CHARACTERISTIC(BT_UUID_THINGSET_DOWNLINK,
                                               BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
                                               BT_GATT_PERM_READ | BT_GATT_PERM_WRITE, NULL,
-                                              thingset_ble_rx, NULL),
+                                              thingset_bluetooth_rx, NULL),
                        BT_GATT_CHARACTERISTIC(BT_UUID_THINGSET_UPLINK, BT_GATT_CHRC_NOTIFY,
                                               BT_GATT_PERM_READ, NULL, NULL, NULL),
-                       BT_GATT_CCC(thingset_ble_ccc_change,
+                       BT_GATT_CCC(thingset_bluetooth_ccc_change,
                                    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), );
 
 /* position of BT_GATT_CCC in array created by BT_GATT_SERVICE_DEFINE */
@@ -83,7 +83,7 @@ static struct bt_conn *ble_conn;
 
 volatile bool notify_resp;
 
-static char rx_buf[CONFIG_THINGSET_BLE_RX_BUF_SIZE];
+static char rx_buf[CONFIG_THINGSET_BLUETOOTH_RX_BUF_SIZE];
 
 static size_t rx_buf_pos = 0;
 static bool discard_buffer;
@@ -94,11 +94,12 @@ static struct k_sem rx_buf_lock;
 static thingset_sdk_rx_callback_t rx_callback;
 
 static struct k_work_delayable processing_work;
+static struct k_work_delayable adv_work;
 #ifdef CONFIG_THINGSET_SUBSET_LIVE_METRICS
 static struct k_work_delayable reporting_work;
 #endif
 
-static void thingset_ble_ccc_change(const struct bt_gatt_attr *attr, uint16_t value)
+static void thingset_bluetooth_ccc_change(const struct bt_gatt_attr *attr, uint16_t value)
 {
     ARG_UNUSED(attr);
     notify_resp = (value == BT_GATT_CCC_NOTIFY);
@@ -106,17 +107,17 @@ static void thingset_ble_ccc_change(const struct bt_gatt_attr *attr, uint16_t va
 }
 
 /*
- * Receives data from BLE interface and decodes it similar to RFC 1055 SLIP protocol
+ * Receives data from Bluetooth interface and decodes it similar to RFC 1055 SLIP protocol
  */
-static ssize_t thingset_ble_rx(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                               const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+static ssize_t thingset_bluetooth_rx(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                     const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
     /* store across multiple packages whether we had an escape char */
     static bool escape = false;
 
     if (k_sem_take(&rx_buf_lock, K_NO_WAIT) == 0) {
-        bool finished = reassemble((uint8_t *)buf, len, rx_buf, CONFIG_THINGSET_BLE_RX_BUF_SIZE,
-                                   &rx_buf_pos, &escape);
+        bool finished = reassemble((uint8_t *)buf, len, rx_buf,
+                                   CONFIG_THINGSET_BLUETOOTH_RX_BUF_SIZE, &rx_buf_pos, &escape);
         if (finished) {
             if (discard_buffer) {
                 rx_buf_pos = 0;
@@ -142,7 +143,7 @@ static ssize_t thingset_ble_rx(struct bt_conn *conn, const struct bt_gatt_attr *
     return len;
 }
 
-static void thingset_ble_conn(struct bt_conn *conn, uint8_t err)
+static void thingset_bluetooth_conn(struct bt_conn *conn, uint8_t err)
 {
     char addr[BT_ADDR_LE_STR_LEN];
 
@@ -157,7 +158,7 @@ static void thingset_ble_conn(struct bt_conn *conn, uint8_t err)
     ble_conn = bt_conn_ref(conn);
 }
 
-static void thingset_ble_disconn(struct bt_conn *conn, uint8_t reason)
+static void thingset_bluetooth_disconn(struct bt_conn *conn, uint8_t reason)
 {
     char addr[BT_ADDR_LE_STR_LEN];
 
@@ -168,9 +169,11 @@ static void thingset_ble_disconn(struct bt_conn *conn, uint8_t reason)
         bt_conn_unref(ble_conn);
         ble_conn = NULL;
     }
+
+    thingset_sdk_reschedule_work(&adv_work, K_NO_WAIT);
 }
 
-int thingset_ble_send(const uint8_t *buf, size_t len)
+int thingset_bluetooth_send(const uint8_t *buf, size_t len)
 {
     if (ble_conn && notify_resp) {
         /* Max. notification: ATT_MTU - 3 */
@@ -192,14 +195,14 @@ int thingset_ble_send(const uint8_t *buf, size_t len)
     }
 }
 
-int thingset_ble_send_report(const char *path)
+int thingset_bluetooth_send_report(const char *path)
 {
     struct shared_buffer *tx_buf = thingset_sdk_shared_buffer();
     k_sem_take(&tx_buf->lock, K_FOREVER);
 
     int len =
         thingset_report_path(&ts, tx_buf->data, tx_buf->size, path, THINGSET_TXT_NAMES_VALUES);
-    int ret = thingset_ble_send(tx_buf->data, len);
+    int ret = thingset_bluetooth_send(tx_buf->data, len);
 
     k_sem_give(&tx_buf->lock);
     return ret;
@@ -207,22 +210,33 @@ int thingset_ble_send_report(const char *path)
 
 #ifdef CONFIG_THINGSET_SUBSET_LIVE_METRICS
 
-static void ble_regular_report_handler(struct k_work *work)
+static void regular_report_handler(struct k_work *work)
 {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     static int64_t pub_time;
 
     if (live_reporting_enable) {
-        thingset_ble_send_report(TS_NAME_SUBSET_LIVE);
+        thingset_bluetooth_send_report(TS_NAME_SUBSET_LIVE);
     }
 
-    pub_time += 1000 * live_reporting_period;
+    pub_time += live_reporting_period;
     thingset_sdk_reschedule_work(dwork, K_TIMEOUT_ABS_MS(pub_time));
 }
 
 #endif
 
-static void ble_process_msg_handler(struct k_work *work)
+static void adv_work_handler(struct k_work *work)
+{
+    int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (err) {
+        LOG_ERR("Advertising failed to start (err %d)", err);
+    }
+    else {
+        LOG_INF("Waiting for Bluetooth connections...");
+    }
+}
+
+static void process_msg_handler(struct k_work *work)
 {
     if (rx_buf_pos > 0) {
         LOG_DBG("Received Request (%d bytes): %s", rx_buf_pos, rx_buf);
@@ -234,7 +248,7 @@ static void ble_process_msg_handler(struct k_work *work)
             int len = thingset_process_message(&ts, (uint8_t *)rx_buf, rx_buf_pos, tx_buf->data,
                                                tx_buf->size);
             if (len > 0) {
-                thingset_ble_send(tx_buf->data, len);
+                thingset_bluetooth_send(tx_buf->data, len);
             }
 
             k_sem_give(&tx_buf->lock);
@@ -250,18 +264,19 @@ static void ble_process_msg_handler(struct k_work *work)
     k_sem_give(&rx_buf_lock);
 }
 
-void thingset_ble_set_rx_callback(thingset_sdk_rx_callback_t rx_cb)
+void thingset_bluetooth_set_rx_callback(thingset_sdk_rx_callback_t rx_cb)
 {
     rx_callback = rx_cb;
 }
 
-static int thingset_ble_init()
+static int thingset_bluetooth_init()
 {
     k_sem_init(&rx_buf_lock, 1, 1);
 
-    k_work_init_delayable(&processing_work, ble_process_msg_handler);
+    k_work_init_delayable(&adv_work, adv_work_handler);
+    k_work_init_delayable(&processing_work, process_msg_handler);
 #ifdef CONFIG_THINGSET_SUBSET_LIVE_METRICS
-    k_work_init_delayable(&reporting_work, ble_regular_report_handler);
+    k_work_init_delayable(&reporting_work, regular_report_handler);
 #endif
 
     int err = bt_enable(NULL);
@@ -270,12 +285,7 @@ static int thingset_ble_init()
         return err;
     }
 
-    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-    if (err) {
-        LOG_ERR("Advertising failed to start (err %d)", err);
-        return err;
-    }
-    LOG_INF("Waiting for Bluetooth connections...");
+    thingset_sdk_reschedule_work(&adv_work, K_NO_WAIT);
 
 #ifdef CONFIG_THINGSET_SUBSET_LIVE_METRICS
     thingset_sdk_reschedule_work(&reporting_work, K_NO_WAIT);
@@ -284,4 +294,4 @@ static int thingset_ble_init()
     return 0;
 }
 
-SYS_INIT(thingset_ble_init, APPLICATION, THINGSET_INIT_PRIORITY_DEFAULT);
+SYS_INIT(thingset_bluetooth_init, APPLICATION, THINGSET_INIT_PRIORITY_DEFAULT);
