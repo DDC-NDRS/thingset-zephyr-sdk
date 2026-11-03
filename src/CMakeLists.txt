@@ -23,5 +23,6 @@ zephyr_library_sources_ifdef(CONFIG_THINGSET_WIFI wifi.c)
 generate_inc_file_for_target(
     app
     certs/isrgrootx1.der
-    certs/isrgrootx1.der.inc
+    ${CMAKE_CURRENT_BINARY_DIR}/certs/isrgrootx1.der.inc
     )
+zephyr_library_include_directories(${CMAKE_CURRENT_BINARY_DIR})
